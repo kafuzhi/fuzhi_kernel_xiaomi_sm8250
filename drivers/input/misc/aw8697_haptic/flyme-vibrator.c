@@ -39,10 +39,12 @@
 #include <linux/string.h>
 #include <linux/mutex.h>
 #include <linux/kdev_t.h>
+#include <linux/leds.h>
 
 #include "aw8697_compat.h"
 
 #define FLYME_VIBRATOR_DEV_NAME "motor"
+#define FLYME_LED_NAME "vibrator"
 
 /* Meizu effect ids in [FLYME_RTP_ID_BASE, FLYME_RTP_ID_MAX] are RTP presets. */
 #define FLYME_RTP_ID_BASE 40001
@@ -103,6 +105,7 @@ struct flyme_vibrator {
 	struct device *motor_dev;
 	struct class *timed_class;
 	struct device *timed_dev;
+	struct led_classdev led;
 
 	struct mutex lock;
 	u8 wave;	/* waveform used by timed_output/vibrator/enable */
@@ -115,6 +118,10 @@ struct flyme_vibrator {
 	u8 rtp_gain;
 	u32 rtp_duration_ms;
 	u32 proline;
+	/* Last effect id written to on_off / effect_id, replayed by activate. */
+	u32 last_effect;
+	/* Raw gain from /sys/class/leds/vibrator/gain, 0 keeps the table value. */
+	u8 led_gain;
 };
 
 static struct flyme_vibrator *flyme_vib;
@@ -138,9 +145,15 @@ static u8 flyme_gain_from_strength(u8 strength)
 	}
 }
 
-static int flyme_play_effect(u32 id)
+static u8 flyme_gain_of(struct flyme_vibrator *vib, u8 fallback)
+{
+	return vib->led_gain ? vib->led_gain : fallback;
+}
+
+static int flyme_play_effect(struct flyme_vibrator *vib, u32 id)
 {
 	const struct flyme_effect *e = &flyme_effect_default;
+	u8 gain;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(flyme_effects); i++) {
@@ -150,11 +163,12 @@ static int flyme_play_effect(u32 id)
 		}
 	}
 
-	pr_debug("effect %u -> %s (wave %u, gain 0x%02x, %u ms)\n", id, e->name,
-		 e->wave, e->gain, e->duration_ms);
+	gain = flyme_gain_of(vib, e->gain);
 
-	return aw8697_compat_play_ram(e->wave, e->loop, e->gain,
-				      e->duration_ms);
+	pr_debug("effect %u -> %s (wave %u, gain 0x%02x, %u ms)\n", id, e->name,
+		 e->wave, gain, e->duration_ms);
+
+	return aw8697_compat_play_ram(e->wave, e->loop, gain, e->duration_ms);
 }
 
 /*
@@ -175,7 +189,7 @@ static int flyme_play_rtp(struct flyme_vibrator *vib, u32 id)
 		duration_ms = vib->rtp_duration_ms;
 	} else {
 		wave = 1 + ((id - FLYME_RTP_ID_BASE) % FLYME_WAVE_MAX);
-		gain = FLYME_GAIN_MEDIUM;
+		gain = flyme_gain_of(vib, FLYME_GAIN_MEDIUM);
 		duration_ms = 20;
 	}
 
@@ -195,12 +209,20 @@ static int flyme_play_rtp(struct flyme_vibrator *vib, u32 id)
 static ssize_t on_off_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "0\n");
+	struct flyme_vibrator *vib = flyme_vib_get(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", vib->last_effect);
 }
 
+/*
+ * 0 stops, 1 replays the effect last written, anything else is an effect id.
+ * Meizu's own on_off node uses the same convention, and so do the LED class
+ * effect_id (same handler) and activate nodes.
+ */
 static ssize_t on_off_store(struct device *dev, struct device_attribute *attr,
 			    const char *buf, size_t count)
 {
+	struct flyme_vibrator *vib = flyme_vib_get(dev);
 	u32 id;
 	int rc;
 
@@ -208,10 +230,25 @@ static ssize_t on_off_store(struct device *dev, struct device_attribute *attr,
 	if (rc)
 		return rc;
 
+	if (!id) {
+		aw8697_compat_stop();
+		return count;
+	}
+
+	if (id == 1) {
+		if (vib->last_effect)
+			flyme_play_effect(vib, vib->last_effect);
+		return count;
+	}
+
+	mutex_lock(&vib->lock);
+	vib->last_effect = id;
+	mutex_unlock(&vib->lock);
+
 	if (id >= FLYME_RTP_ID_BASE && id <= FLYME_RTP_ID_MAX)
-		flyme_play_rtp(flyme_vib_get(dev), id);
+		flyme_play_rtp(vib, id);
 	else
-		flyme_play_effect(id);
+		flyme_play_effect(vib, id);
 
 	return count;
 }
@@ -451,7 +488,9 @@ static ssize_t proline_store(struct device *dev, struct device_attribute *attr,
 	mutex_unlock(&vib->lock);
 
 	if (on)
-		aw8697_compat_play_ram(vib->wave, 1, FLYME_GAIN_MEDIUM, 0);
+		aw8697_compat_play_ram(vib->wave, 1,
+				       flyme_gain_of(vib, FLYME_GAIN_MEDIUM),
+				       0);
 	else
 		aw8697_compat_stop();
 
@@ -529,7 +568,9 @@ static ssize_t enable_store(struct device *dev, struct device_attribute *attr,
 	}
 
 	/* Loop the selected waveform for the requested time. */
-	aw8697_compat_play_ram(vib->wave, 1, FLYME_GAIN_MEDIUM, duration_ms);
+	aw8697_compat_play_ram(vib->wave, 1,
+			       flyme_gain_of(vib, FLYME_GAIN_MEDIUM),
+			       duration_ms);
 
 	return count;
 }
@@ -542,6 +583,91 @@ static struct attribute *flyme_timed_attrs[] = {
 
 static const struct attribute_group flyme_timed_group = {
 	.attrs = flyme_timed_attrs,
+};
+
+/* ------------------------------------------------------------------ *
+ * /sys/class/leds/vibrator
+ *
+ * FlymeVibratorHelper keeps three more constants on the LED class:
+ * CONTROL_PATH_EFFECTID, CONTROL_PATH_ACTIVATE and CONTROL_PATH_GAIN.
+ * effect_id speaks the same id space as on_off, activate is the 0/1
+ * start-stop of the last effect, and gain is the raw AW8697 gain value.
+ * ------------------------------------------------------------------ */
+
+static ssize_t activate_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct flyme_vibrator *vib = flyme_vib_get(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", vib->last_effect ? 1 : 0);
+}
+
+static ssize_t activate_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct flyme_vibrator *vib = flyme_vib_get(dev);
+	u32 on;
+	int rc;
+
+	rc = kstrtou32(buf, 0, &on);
+	if (rc)
+		return rc;
+
+	if (!on) {
+		aw8697_compat_stop();
+		return count;
+	}
+
+	if (vib->last_effect)
+		flyme_play_effect(vib, vib->last_effect);
+
+	return count;
+}
+static FLYME_DEVICE_ATTR_RW(activate);
+
+static ssize_t led_gain_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct flyme_vibrator *vib = flyme_vib_get(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", vib->led_gain);
+}
+
+/* Raw gain register value; it overrides the effect table for later plays. */
+static ssize_t led_gain_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct flyme_vibrator *vib = flyme_vib_get(dev);
+	u32 gain;
+	int rc;
+
+	rc = kstrtou32(buf, 0, &gain);
+	if (rc)
+		return rc;
+	if (gain > 0xff)
+		gain = 0xff;
+
+	mutex_lock(&vib->lock);
+	vib->led_gain = gain;
+	mutex_unlock(&vib->lock);
+
+	return count;
+}
+static FLYME_DEVICE_ATTR_RW(led_gain);
+
+/* Same effect id space as on_off, so it reuses those handlers. */
+static struct device_attribute dev_attr_led_effect_id =
+	__ATTR(effect_id, 0660, on_off_show, on_off_store);
+
+static struct attribute *flyme_led_attrs[] = {
+	&dev_attr_led_effect_id.attr,
+	&dev_attr_activate.attr,
+	&dev_attr_led_gain.attr,
+	NULL,
+};
+
+static const struct attribute_group flyme_led_group = {
+	.attrs = flyme_led_attrs,
 };
 
 /* ------------------------------------------------------------------ *
@@ -603,12 +729,29 @@ int flyme_vibrator_register(void)
 	if (rc)
 		goto err_timed_dev;
 
+	vib->led.name = FLYME_LED_NAME;
+	vib->led.max_brightness = 0xff;
+	rc = led_classdev_register(NULL, &vib->led);
+	if (rc) {
+		pr_err("failed to register LED class device: %d\n", rc);
+		goto err_timed_group;
+	}
+
+	dev_set_drvdata(vib->led.dev, vib);
+	rc = sysfs_create_group(&vib->led.dev->kobj, &flyme_led_group);
+	if (rc)
+		goto err_led;
+
 	flyme_vib = vib;
 
 	pr_info("Flyme vibrator compatibility layer ready\n");
 
 	return 0;
 
+err_led:
+	led_classdev_unregister(&vib->led);
+err_timed_group:
+	sysfs_remove_group(&vib->timed_dev->kobj, &flyme_timed_group);
 err_timed_dev:
 	device_destroy(vib->timed_class, MKDEV(0, 0));
 err_timed_class:
@@ -637,6 +780,9 @@ void flyme_vibrator_unregister(void)
 	flyme_vib = NULL;
 
 	aw8697_compat_stop();
+
+	sysfs_remove_group(&vib->led.dev->kobj, &flyme_led_group);
+	led_classdev_unregister(&vib->led);
 
 	sysfs_remove_group(&vib->timed_dev->kobj, &flyme_timed_group);
 	device_destroy(vib->timed_class, MKDEV(0, 0));
