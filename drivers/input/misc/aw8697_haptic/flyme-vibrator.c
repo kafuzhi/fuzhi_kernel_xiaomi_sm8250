@@ -753,17 +753,20 @@ static void flyme_give_to_system(struct kobject *kobj, struct attribute **attrs)
 	};
 	const struct flyme_perm *perm;
 	struct kernfs_node *kn;
-	int i, j;
+	int i, j, rc;
 
 	for (i = 0; attrs[i]; i++) {
 		kn = kernfs_find_and_get(kobj->sd, attrs[i]->name);
-		if (!kn)
+		if (!kn) {
+			pr_info("fzv-node: %s NOT FOUND\n", attrs[i]->name);
 			continue;
+		}
 
 		for (j = 0; j < ARRAY_SIZE(flyme_perms); j++)
 			if (!strcmp(flyme_perms[j].name, attrs[i]->name))
 				break;
 		if (j == ARRAY_SIZE(flyme_perms)) {
+			pr_info("fzv-node: %s no perm entry\n", attrs[i]->name);
 			kernfs_put(kn);
 			continue;
 		}
@@ -774,7 +777,10 @@ static void flyme_give_to_system(struct kobject *kobj, struct attribute **attrs)
 		/* kernfs keeps S_IFREG inside ->mode, so mask it through. */
 		newattrs.ia_mode = (perm->mode & S_IALLUGO) |
 				   (kn->mode & ~S_IALLUGO);
-		kernfs_setattr(kn, &newattrs);
+		rc = kernfs_setattr(kn, &newattrs);
+		pr_info("fzv-node: %s want=%o:%u:%u rc=%d got=%o\n",
+			attrs[i]->name, (unsigned int)perm->mode, perm->uid,
+			perm->gid, rc, (unsigned int)kn->mode);
 		kernfs_put(kn);
 	}
 }
