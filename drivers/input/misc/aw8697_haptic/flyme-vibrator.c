@@ -121,7 +121,7 @@ struct flyme_vibrator {
 	/* Last effect id written to on_off / effect_id, replayed by activate. */
 	u32 last_effect;
 	/* Raw gain from /sys/class/leds/vibrator/gain, 0 keeps the table value. */
-	u8 led_gain;
+	u8 gain;
 };
 
 static struct flyme_vibrator *flyme_vib;
@@ -147,7 +147,7 @@ static u8 flyme_gain_from_strength(u8 strength)
 
 static u8 flyme_gain_of(struct flyme_vibrator *vib, u8 fallback)
 {
-	return vib->led_gain ? vib->led_gain : fallback;
+	return vib->gain ? vib->gain : fallback;
 }
 
 static int flyme_play_effect(struct flyme_vibrator *vib, u32 id)
@@ -625,16 +625,16 @@ static ssize_t activate_store(struct device *dev, struct device_attribute *attr,
 }
 static FLYME_DEVICE_ATTR_RW(activate);
 
-static ssize_t led_gain_show(struct device *dev, struct device_attribute *attr,
+static ssize_t gain_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
 	struct flyme_vibrator *vib = flyme_vib_get(dev);
 
-	return scnprintf(buf, PAGE_SIZE, "%u\n", vib->led_gain);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", vib->gain);
 }
 
 /* Raw gain register value; it overrides the effect table for later plays. */
-static ssize_t led_gain_store(struct device *dev, struct device_attribute *attr,
+static ssize_t gain_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
 	struct flyme_vibrator *vib = flyme_vib_get(dev);
@@ -648,12 +648,12 @@ static ssize_t led_gain_store(struct device *dev, struct device_attribute *attr,
 		gain = 0xff;
 
 	mutex_lock(&vib->lock);
-	vib->led_gain = gain;
+	vib->gain = gain;
 	mutex_unlock(&vib->lock);
 
 	return count;
 }
-static FLYME_DEVICE_ATTR_RW(led_gain);
+static FLYME_DEVICE_ATTR_RW(gain);
 
 /* Same effect id space as on_off, so it reuses those handlers. */
 static struct device_attribute dev_attr_led_effect_id =
@@ -662,7 +662,7 @@ static struct device_attribute dev_attr_led_effect_id =
 static struct attribute *flyme_led_attrs[] = {
 	&dev_attr_led_effect_id.attr,
 	&dev_attr_activate.attr,
-	&dev_attr_led_gain.attr,
+	&dev_attr_gain.attr,
 	NULL,
 };
 
