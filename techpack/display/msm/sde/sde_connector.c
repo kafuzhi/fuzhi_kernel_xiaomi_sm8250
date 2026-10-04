@@ -82,6 +82,7 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 	int bl_lvl;
 	struct drm_event event;
 	int rc = 0;
+	bool blanking;
 
 	brightness = bd->props.brightness;
 
@@ -104,9 +105,10 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 		brightness = (brightness <= bd->thermal_brightness_clone_limit) ? brightness : bd->thermal_brightness_clone_limit;
 		bd->props.brightness = brightness;
 	}
-	if ((bd->props.power != FB_BLANK_UNBLANK) ||
+	blanking = (bd->props.power != FB_BLANK_UNBLANK) ||
 			(bd->props.state & BL_CORE_FBBLANK) ||
-			(bd->props.state & BL_CORE_SUSPENDED))
+			(bd->props.state & BL_CORE_SUSPENDED);
+	if (blanking)
 		brightness = 0;
 
 	if (brightness > display->panel->bl_config.brightness_max_level)
@@ -125,6 +127,25 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 
 	if (!c_conn->allow_bl_update) {
 		c_conn->unset_bl_level = bl_lvl;
+		return 0;
+	}
+
+	/*
+	 * The Flyme(Meizu) display HAL writes brightness 0 right before every
+	 * real brightness update. Swallow that transient 0 here, before it can
+	 * reach the panel or mi_dimlayer_state: on this panel a 0 blanks the
+	 * backlight, and current_backlight = 0 is later turned into a fully
+	 * opaque black overlay by brightness_to_alpha() (j11 LUT: brightness 0
+	 * -> alpha 0xFF), i.e. a full screen black flash on every brightness
+	 * step. props.brightness is restored so HAL readback stays sane.
+	 * A real screen blank must not be swallowed, hence the blanking gate.
+	 */
+	if (brightness == 0 && !blanking &&
+			c_conn->mi_dimlayer_state.current_backlight > 0 &&
+			display->panel->panel_initialized &&
+			!display->panel->mi_cfg.in_aod) {
+		bd->props.brightness =
+			c_conn->mi_dimlayer_state.current_backlight;
 		return 0;
 	}
 
