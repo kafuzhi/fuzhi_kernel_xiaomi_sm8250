@@ -39,6 +39,7 @@
 #include <linux/string.h>
 #include <linux/mutex.h>
 #include <linux/kdev_t.h>
+#include <linux/fs.h>
 #include <linux/leds.h>
 
 #include "aw8697_compat.h"
@@ -655,6 +656,32 @@ static ssize_t gain_store(struct device *dev, struct device_attribute *attr,
 }
 static FLYME_DEVICE_ATTR_RW(gain);
 
+/*
+ * The LED class exposes "brightness" as well, and AOSP style vibrator HALs
+ * drive the LED path through it: 0 turns the motor off, anything else is an
+ * amplitude.  Without a brightness_set callback that write is silently inert.
+ */
+static void flyme_led_brightness_set(struct led_classdev *cdev,
+				     enum led_brightness value)
+{
+	struct flyme_vibrator *vib = container_of(cdev, struct flyme_vibrator,
+						  led);
+
+	if (!value) {
+		aw8697_compat_stop();
+		return;
+	}
+
+	mutex_lock(&vib->lock);
+	/* 1..2 are Meizu's three strength levels, above that a raw gain. */
+	if (value > 2)
+		vib->gain = value > 0xff ? 0xff : value;
+	mutex_unlock(&vib->lock);
+
+	if (vib->last_effect)
+		flyme_play_effect(vib, vib->last_effect);
+}
+
 /* Same effect id space as on_off, so it reuses those handlers. */
 static struct device_attribute dev_attr_led_effect_id =
 	__ATTR(effect_id, 0660, on_off_show, on_off_store);
@@ -673,6 +700,84 @@ static const struct attribute_group flyme_led_group = {
 /* ------------------------------------------------------------------ *
  * registration, driven by the AW8697 probe
  * ------------------------------------------------------------------ */
+
+/*
+ * Flyme's framework and HALs open these nodes from processes that are neither
+ * their owner nor in their group, so every write came back EACCES.  __ATTR()
+ * cannot carry the needed bits -- VERIFY_OCTAL_PERMISSIONS() rejects a world
+ * writable mode at compile time -- and sysfs offers no chown helper, so hand
+ * the files over through kernfs directly.
+ *
+ * The ownership and modes below are Meizu's own, lifted from the permission
+ * block of init.target.rc:
+ *
+ *	chmod 0666 /sys/class/meizu/motor/on_off
+ *	chown system system /sys/class/meizu/motor/on_off
+ *	...
+ *	chown system audio /sys/class/meizu/motor/haptic_audio
+ *	chmod 0660 /sys/class/meizu/motor/haptic_audio
+ *
+ * Doing it here instead of in an rc file is what makes a kernel-only flash
+ * sufficient, since that rc file lives in the ROM's system image.  The three
+ * LED nodes are absent from that block (FlymeVibratorHelper runs inside the
+ * framework, i.e. as system) and "waveform" is absent too, so both get the
+ * conservative system/system 0660.
+ */
+struct flyme_perm {
+	const char *name;
+	unsigned int uid;
+	unsigned int gid;
+	umode_t mode;
+};
+
+static const struct flyme_perm flyme_perms[] = {
+	{ "on_off",       1000, 1000, 0666 },
+	{ "freq",         1000, 1000, 0666 },
+	{ "rtp",          1000, 1000, 0666 },
+	{ "set_rtp",      1000, 1000, 0666 },
+	{ "set_cspress",  1000, 1000, 0666 },
+	{ "set_mback",    1000, 1000, 0666 },
+	{ "proline",      1000, 1000, 0666 },
+	{ "waveform",     1000, 1000, 0666 },
+	{ "enable",       1000, 1000, 0666 },
+	{ "haptic_audio", 1000, 1005, 0660 },
+	{ "effect_id",    1000, 1000, 0660 },
+	{ "activate",     1000, 1000, 0660 },
+	{ "gain",         1000, 1000, 0660 },
+};
+
+static void flyme_give_to_system(struct kobject *kobj, struct attribute **attrs)
+{
+	struct iattr newattrs = {
+		.ia_valid = ATTR_MODE | ATTR_UID | ATTR_GID,
+	};
+	const struct flyme_perm *perm;
+	struct kernfs_node *kn;
+	int i, j;
+
+	for (i = 0; attrs[i]; i++) {
+		kn = kernfs_find_and_get(kobj->sd, attrs[i]->name);
+		if (!kn)
+			continue;
+
+		for (j = 0; j < ARRAY_SIZE(flyme_perms); j++)
+			if (!strcmp(flyme_perms[j].name, attrs[i]->name))
+				break;
+		if (j == ARRAY_SIZE(flyme_perms)) {
+			kernfs_put(kn);
+			continue;
+		}
+
+		perm = &flyme_perms[j];
+		newattrs.ia_uid = KUIDT_INIT(perm->uid);
+		newattrs.ia_gid = KGIDT_INIT(perm->gid);
+		/* kernfs keeps S_IFREG inside ->mode, so mask it through. */
+		newattrs.ia_mode = (perm->mode & S_IALLUGO) |
+				   (kn->mode & ~S_IALLUGO);
+		kernfs_setattr(kn, &newattrs);
+		kernfs_put(kn);
+	}
+}
 
 int flyme_vibrator_register(void)
 {
@@ -712,6 +817,8 @@ int flyme_vibrator_register(void)
 	if (rc)
 		goto err_motor_dev;
 
+	flyme_give_to_system(&vib->motor_dev->kobj, flyme_motor_attrs);
+
 	vib->timed_class = class_create(THIS_MODULE, "timed_output");
 	if (IS_ERR(vib->timed_class)) {
 		rc = PTR_ERR(vib->timed_class);
@@ -729,8 +836,11 @@ int flyme_vibrator_register(void)
 	if (rc)
 		goto err_timed_dev;
 
+	flyme_give_to_system(&vib->timed_dev->kobj, flyme_timed_attrs);
+
 	vib->led.name = FLYME_LED_NAME;
 	vib->led.max_brightness = 0xff;
+	vib->led.brightness_set = flyme_led_brightness_set;
 	rc = led_classdev_register(NULL, &vib->led);
 	if (rc) {
 		pr_err("failed to register LED class device: %d\n", rc);
@@ -741,6 +851,8 @@ int flyme_vibrator_register(void)
 	rc = sysfs_create_group(&vib->led.dev->kobj, &flyme_led_group);
 	if (rc)
 		goto err_led;
+
+	flyme_give_to_system(&vib->led.dev->kobj, flyme_led_attrs);
 
 	flyme_vib = vib;
 
