@@ -38,6 +38,7 @@
 #include "aw8697_reg.h"
 #include "aw869xx_reg.h"
 #include "aw8697.h"
+#include "aw8697_compat.h"
 #include "ringbuffer.h"
 
 /******************************************************
@@ -6917,6 +6918,10 @@ static int aw8697_i2c_probe(struct i2c_client *i2c,
 
 	CUSTOME_WAVE_ID = aw8697->info.effect_max;
 
+#ifdef CONFIG_INPUT_AW8697_HAPTIC_FLYME_VIBRATOR
+	flyme_vibrator_register();
+#endif
+
 	aw_pr_info("%s probe completed successfully!\n", __func__);
 
 	return 0;
@@ -6949,6 +6954,9 @@ static int aw8697_i2c_remove(struct i2c_client *i2c)
 	struct aw8697 *aw8697 = i2c_get_clientdata(i2c);
 
 	aw_pr_info("%s enter\n", __func__);
+#ifdef CONFIG_INPUT_AW8697_HAPTIC_FLYME_VIBRATOR
+	flyme_vibrator_unregister();
+#endif
 	if (aw8697->chip_version == AW8697_CHIP_9X) {
 		sysfs_remove_group(&i2c->dev.kobj,
 				   &aw8697_vibrator_attribute_group);
@@ -6973,6 +6981,91 @@ static int aw8697_i2c_remove(struct i2c_client *i2c)
 
 	return 0;
 }
+
+#ifdef CONFIG_INPUT_AW8697_HAPTIC_FLYME_VIBRATOR
+/* ------------------------------------------------------------------ *
+ * Flyme / Meizu vibrator compatibility API
+ *
+ * An additive surface used by flyme-vibrator.c, which re-creates the Meizu
+ * /sys/class/meizu/motor interface that Flyme userspace expects.  Nothing
+ * here changes the driver's existing behaviour.
+ * ------------------------------------------------------------------ */
+
+/*
+ * Play one RAM waveform.
+ *
+ * @wave:        sequencer waveform number (0..AW8697_SEQUENCER_SIZE-1)
+ * @loop:        repeat the waveform until the duration elapses
+ * @gain:        AW8697 gain register value
+ * @duration_ms: 0 plays the waveform once, otherwise the chip is stopped
+ *               after this many milliseconds
+ */
+int aw8697_compat_play_ram(unsigned char wave, bool loop, unsigned char gain,
+			   unsigned int duration_ms)
+{
+	struct aw8697 *aw8697 = g_aw8697;
+
+	if (!aw8697)
+		return -ENODEV;
+
+	if (wave >= AW8697_SEQUENCER_SIZE)
+		wave = AW8697_SEQUENCER_SIZE - 1;
+
+	aw_pr_info("%s: wave=%d loop=%d gain=0x%02x duration=%uns\n", __func__,
+		   wave, loop, gain, duration_ms);
+
+	mutex_lock(&aw8697->lock);
+	hrtimer_cancel(&aw8697->timer);
+	aw8697_haptic_upload_lra(aw8697, F0_CALI);
+	aw8697_haptic_stop(aw8697);
+	/* Same battery compensation the driver's own RAM/RAM_LOOP paths use. */
+	aw8697_haptic_ram_vbat_comp(aw8697, loop);
+
+	aw8697->state = 1;
+	if (aw8697->info.bst_vol_ram <= AW8697_MAX_BST_VO)
+		aw8697_haptic_set_bst_vol(aw8697, aw8697->info.bst_vol_ram);
+	else
+		aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
+
+	aw8697_haptic_set_gain(aw8697, gain);
+	aw8697_haptic_set_wav_seq(aw8697, 0x00, wave);
+	aw8697_haptic_set_wav_seq(aw8697, 0x01, 0x00);
+	aw8697_haptic_set_wav_loop(aw8697, 0x00,
+				   loop ? AW8697_BIT_WAVLOOP_INIFINITELY : 0x00);
+	aw8697_haptic_play_mode(aw8697, AW8697_HAPTIC_RAM_MODE);
+	aw8697_haptic_start(aw8697);
+	mutex_unlock(&aw8697->lock);
+
+	/*
+	 * The driver's own timer callback clears @state and queues
+	 * aw8697_vibrator_work, which stops the chip, so a timed vibration
+	 * needs no extra bookkeeping here.
+	 */
+	if (duration_ms)
+		hrtimer_start(&aw8697->timer,
+			      ktime_set(duration_ms / 1000,
+					(duration_ms % 1000) * 1000000),
+			      HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+int aw8697_compat_stop(void)
+{
+	struct aw8697 *aw8697 = g_aw8697;
+
+	if (!aw8697)
+		return -ENODEV;
+
+	mutex_lock(&aw8697->lock);
+	hrtimer_cancel(&aw8697->timer);
+	aw8697->state = 0;
+	aw8697_haptic_stop(aw8697);
+	mutex_unlock(&aw8697->lock);
+
+	return 0;
+}
+#endif /* CONFIG_INPUT_AW8697_HAPTIC_FLYME_VIBRATOR */
 
 static const struct i2c_device_id aw8697_i2c_id[] = {
 	{ AW8697_I2C_NAME, 0 },

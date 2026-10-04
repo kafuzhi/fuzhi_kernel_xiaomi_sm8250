@@ -21,3 +21,23 @@ config INPUT_AW8697_HAPTIC_DAGU
 	  dagu.
 
 	  If unsure, say N.
+
+config INPUT_AW8697_HAPTIC_FLYME_VIBRATOR
+	bool "Flyme / Meizu vibrator compatibility nodes"
+	depends on INPUT_AW8697_HAPTIC
+	depends on !INPUT_AW8697_HAPTIC_DAGU
+	default y
+	help
+	  Re-create the Meizu specific vibrator interface on top of the AW8697
+	  haptic driver:
+
+	    /sys/class/meizu/motor/{on_off,rtp,set_rtp,set_mback,set_cspress,
+	                           waveform,freq,proline,haptic_audio}
+	    /sys/class/timed_output/vibrator/enable
+
+	  Flyme's userspace (FlymeVibratorHelper and Meizu's vibrator HAL)
+	  drives the motor exclusively through those nodes, so vibration stays
+	  dead on a device running a Flyme port unless they exist.
+
+	  Say Y if the ROM's vibrator HAL or framework talks to the Meizu
+	  motor nodes.  If unsure, say N.

@@ -19,3 +19,6 @@ else
 aw8697-haptic-objs = aw8697.o
 endif
 aw8697-haptic-objs += ringbuffer.o
+ifeq ($(CONFIG_INPUT_AW8697_HAPTIC_FLYME_VIBRATOR),y)
+aw8697-haptic-objs += flyme-vibrator.o
+endif
