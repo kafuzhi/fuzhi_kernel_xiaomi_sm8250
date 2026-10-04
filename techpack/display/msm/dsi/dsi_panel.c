@@ -942,6 +942,24 @@ int dsi_panel_set_fod_hbm(struct dsi_panel *panel, bool status)
 	return rc;
 }
 
+/* temp: transient-0 hunt. Cheap, first 40 non-zero writes plus every 0. */
+static void fzv_dump(struct dsi_panel *panel, u32 bl_lvl)
+{
+	static unsigned int fzv_zero;
+	static unsigned int fzv_all;
+	struct dsi_panel_mi_cfg *mi = &panel->mi_cfg;
+
+	if (bl_lvl == 0)
+		fzv_zero++;
+	else if (fzv_all++ >= 40)
+		return;
+
+	pr_info("fzv-bl: lvl=%u last=%u dct=%u dcen=%d hbm=%d pm=%d init=%d aod=%d zero=%u\n",
+		bl_lvl, mi->last_bl_level, mi->dc_type, (int)mi->dc_enable,
+		(int)mi->hbm_enabled, panel->power_mode,
+		(int)panel->panel_initialized, (int)mi->in_aod, fzv_zero);
+}
+
 int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 {
 	int rc = 0;
@@ -960,11 +978,19 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	 * brightness step shows a black flash. Swallow it while the display is
 	 * on; a real screen-off goes through dsi_panel_set_off() and does not
 	 * reach this function.
+	 *
+	 * Do not gate this on panel->power_mode: the only writer of that field
+	 * is dsi_display_set_power(), which sde_connector only reaches when the
+	 * DPMS/LP mode actually changes, so it can sit at its probe-time OFF
+	 * while the panel is lit. panel_initialized is maintained by
+	 * dsi_panel_set_on()/dsi_panel_set_off() and is the reliable "screen is
+	 * on" signal here.
 	 */
+	fzv_dump(panel, bl_lvl);
 	if (bl_lvl == 0 && mi_cfg->dc_type && mi_cfg->last_bl_level > 0 &&
-	    panel->power_mode == SDE_MODE_DPMS_ON && !mi_cfg->in_aod) {
-		DSI_INFO("skip transient backlight 0 (last %d)\n",
-			 mi_cfg->last_bl_level);
+	    panel->panel_initialized && !mi_cfg->in_aod) {
+		pr_info("fzv-bl: SKIP transient 0 (last %u)\n",
+			mi_cfg->last_bl_level);
 		return rc;
 	}
 
