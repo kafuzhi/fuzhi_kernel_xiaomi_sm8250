@@ -953,6 +953,21 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	if (panel->host_config.ext_bridge_mode)
 		return 0;
 
+	/*
+	 * The Flyme(Meizu) display HAL writes a 0 right before every real
+	 * brightness update (harmless on a Meizu panel). Here that 0 really
+	 * blanks the backlight (0x51 = 0) and also clears dc_enable, so every
+	 * brightness step shows a black flash. Swallow it while the display is
+	 * on; a real screen-off goes through dsi_panel_set_off() and does not
+	 * reach this function.
+	 */
+	if (bl_lvl == 0 && mi_cfg->dc_type && mi_cfg->last_bl_level > 0 &&
+	    panel->power_mode == SDE_MODE_DPMS_ON && !mi_cfg->in_aod) {
+		DSI_INFO("skip transient backlight 0 (last %d)\n",
+			 mi_cfg->last_bl_level);
+		return rc;
+	}
+
         if (bl_lvl > 0)
                 bl_lvl = ea_panel_calc_backlight(bl_lvl < bl_dc_min ? bl_dc_min : bl_lvl);
 
@@ -1037,6 +1052,14 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		if (mi_cfg->panel_on_dimming_delay)
 			schedule_delayed_work(&mi_cfg->dimming_enable_delayed_work,
 				msecs_to_jiffies(mi_cfg->panel_on_dimming_delay));
+
+		/*
+		 * Keep the panel IC's DC dimming armed. It is cleared on backlight 0
+		 * and on panel off, and nothing in the Flyme ROM re-arms it (MIUI
+		 * does that from PowerKeeper), which leaves low brightness on PWM.
+		 */
+		if (mi_cfg->dc_type)
+			mi_cfg->dc_enable = true;
 
 		if (mi_cfg->dimming_state == STATE_DIM_RESTORE)
 			mi_cfg->dimming_state = STATE_NONE;
